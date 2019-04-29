@@ -1,0 +1,17 @@
+[package]
+name = "tcpteardown"
+version = "0.1.0"
+authors = ["Christian Schwarz <me@cschwarz.com>"]
+edition = "2018"
+
+[dependencies]
+structopt = "*"
+failure = "*"
+log = "*"
+bytes = "*"
+env_logger = "*"
+net2 = "*"
+strum = "*"
+strum_macros = "*"
+humantime = "*"
+spin_sleep = "*"
