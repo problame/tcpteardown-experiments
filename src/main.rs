@@ -63,6 +63,7 @@ enum TeardownMode {
     CloseImmediately,
     DrainThenClose,
     ShutdownWriteThenDrain,
+    ShutdownWriteThenClose,
     SleepThenClose,
     ShutdownBothThenClose,
 }
@@ -142,6 +143,9 @@ impl Server {
 
                 match self.teardown_mode {
                     TeardownMode::CloseImmediately => {}
+                    TeardownMode::SleepThenClose => {
+                        spin_sleep::sleep(self.sleep.into());
+                    }
 
                     TeardownMode::DrainThenClose => {
                         log::info!("draining connection");
@@ -160,9 +164,15 @@ impl Server {
 
                         log::info!("implicit drop & close of the connection");
                     }
-                    TeardownMode::SleepThenClose => {
-                        spin_sleep::sleep(self.sleep.into());
+
+                    TeardownMode::ShutdownWriteThenClose => {
+                        time_and_log_debug!("shutdown write duration", {
+                            write
+                                .shutdown(net::Shutdown::Write)
+                                .context("shutdown write")?;
+                        });
                     }
+
                     TeardownMode::ShutdownBothThenClose => {
                         time_and_log_debug!("shutdown duration", {
                             write.shutdown(net::Shutdown::Both).context("shutdown")?;
