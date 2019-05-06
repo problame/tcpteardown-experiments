@@ -1,17 +1,15 @@
+use std::io::{self, prelude::*, BufReader, BufWriter};
+use std::net::{self, TcpStream};
+use std::sync::{
+    atomic::{self, AtomicBool},
+    Arc,
+};
+
 use bytes::{BigEndian, ByteOrder};
 use failure::ResultExt;
 use log;
-use std::io;
-use std::io::prelude::*;
-use std::net;
-use std::net::TcpStream;
-use std::sync::atomic::{self, AtomicBool};
-use std::sync::Arc;
+use net2::unix::UnixTcpBuilderExt;
 use structopt::StructOpt;
-
-mod maybe_buffered;
-use maybe_buffered::{split_tcp_stream, MaybeBufferedReader, MaybeBufferedWriter};
-
 #[macro_use]
 extern crate strum_macros;
 
@@ -39,8 +37,6 @@ struct Server {
         help = "`close-immediately`, `drain-then-close`, `shutdown-write-then-drain`, `sleep-then-close`, `shutdown-both-then-close`"
     )]
     teardown_mode: TeardownMode,
-    #[structopt(long = "buffered")]
-    buffered: bool,
     #[structopt(
         long = "sleep",
         help = "time to sleep when using `sleep-then-close` teardown mode",
@@ -74,8 +70,6 @@ struct Client {
     connect: String,
     #[structopt(long = "times", default_value = "1")]
     times: usize,
-    #[structopt(long = "buffered")]
-    buffered: bool,
 }
 
 fn main() {
@@ -109,88 +103,87 @@ impl Server {
                     log::info!("accepted connection {:?}", conn);
                     use net2::TcpStreamExt;
                     conn.set_linger(self.linger.map(|hd| hd.into()))?;
-                    let (read, write) = split_tcp_stream(conn, self.buffered);
-                    self.handle_conn(read, write)?;
+                    self.handle_conn(conn)?;
                 }
                 Err(e) => log::error!("accept error: {:?}", e),
             }
         }
     }
 
-    /// read numbers until we hit an odd number
-    /// send the odd number back to the client, then tear-down the connection
-    /// (the server configuration supports different kinds of tear-downs)
-    fn handle_conn(
-        &self,
-        mut read: MaybeBufferedReader,
-        write: MaybeBufferedWriter,
-    ) -> Result<(), failure::Error> {
+    fn handle_conn(&self, mut conn: TcpStream) -> Result<(), failure::Error> {
+        // buffer for number
         let mut buf = vec![0 as u8; 4];
-        loop {
-            read.read_exact(&mut buf[..])
-                .context("read from connection")?;
-            let num = BigEndian::read_u32(&buf[..]);
 
-            if num % 2 == 0 {
-                continue;
-            } else {
-                log::info!("client sent odd number {:?}", num);
-                let mut write: TcpStream = write
-                    .unbuffered()
-                    .context("convert buffered writer to unbuffered writer")?;
-                write.write(&buf[..]).context("write error to connection")?;
-                let mut read: TcpStream = read.unbuffered();
+        // read from the connection until we encounter the first odd number
+        let first_odd_num = {
+            // use buffered I/O to avoid a syscall every iteration of the loop
+            let mut conn = BufReader::new(&mut conn);
 
-                match self.teardown_mode {
-                    TeardownMode::CloseImmediately => {}
-                    TeardownMode::SleepThenClose => {
-                        spin_sleep::sleep(self.sleep.into());
-                    }
+            loop {
+                conn.read_exact(&mut buf[..])
+                    .context("read from connection")?;
+                let num = BigEndian::read_u32(&buf[..]);
 
-                    TeardownMode::DrainThenClose => {
-                        log::info!("draining connection");
-                        let drained_bytes = self.drain(&mut read)?;
-                        log::info!("drained {:?} bytes", drained_bytes);
-
-                        log::info!("implicit drop & close of the connection");
-                    }
-                    TeardownMode::ShutdownWriteThenDrain => {
-                        log::info!("shutting down write-end of the connection");
-                        write.shutdown(net::Shutdown::Write).context("shutdown")?;
-
-                        log::info!("draining connection");
-                        let drained_bytes = self.drain(&mut read)?;
-                        log::info!("drained {:?} bytes", drained_bytes);
-
-                        log::info!("implicit drop & close of the connection");
-                    }
-
-                    TeardownMode::ShutdownWriteThenClose => {
-                        time_and_log_debug!("shutdown write duration", {
-                            write
-                                .shutdown(net::Shutdown::Write)
-                                .context("shutdown write")?;
-                        });
-                    }
-
-                    TeardownMode::ShutdownBothThenClose => {
-                        time_and_log_debug!("shutdown duration", {
-                            write.shutdown(net::Shutdown::Both).context("shutdown")?;
-                        });
-                    }
+                if num % 2 == 0 {
+                    continue;
+                } else {
+                    log::info!("client sent odd number {:?}", num);
+                    break num;
                 }
-                time_and_log_debug!("close duration", {
-                    drop(read);
-                    drop(write);
-                });
+            }
+        };
 
-                return Ok(());
+        // send the odd number back to the client
+        BigEndian::write_u32(&mut buf, first_odd_num);
+        conn.write(&buf).context("write odd number to connection")?;
+
+        // close the connection according to parameter
+        match self.teardown_mode {
+            TeardownMode::CloseImmediately => {}
+            TeardownMode::SleepThenClose => {
+                spin_sleep::sleep(self.sleep.into());
+            }
+
+            TeardownMode::DrainThenClose => {
+                log::info!("draining connection");
+                let drained_bytes = Self::drain(&mut conn)?;
+                log::info!("drained {:?} bytes", drained_bytes);
+
+                log::info!("implicit drop & close of the connection");
+            }
+            TeardownMode::ShutdownWriteThenDrain => {
+                log::info!("shutting down write-end of the connection");
+                conn.shutdown(net::Shutdown::Write).context("shutdown")?;
+
+                log::info!("draining connection");
+                let drained_bytes = Self::drain(&mut conn)?;
+                log::info!("drained {:?} bytes", drained_bytes);
+
+                log::info!("implicit drop & close of the connection");
+            }
+
+            TeardownMode::ShutdownWriteThenClose => {
+                time_and_log_debug!("shutdown write duration", {
+                    conn.shutdown(net::Shutdown::Write)
+                        .context("shutdown write")?;
+                });
+            }
+
+            TeardownMode::ShutdownBothThenClose => {
+                time_and_log_debug!("shutdown duration", {
+                    conn.shutdown(net::Shutdown::Both).context("shutdown")?;
+                });
             }
         }
+        time_and_log_debug!("close duration", {
+            drop(conn);
+        });
+
+        Ok(())
     }
 
     /// read & discard from the connection until EOF
-    fn drain(&self, conn: &mut TcpStream) -> Result<u64, failure::Error> {
+    fn drain(conn: &mut TcpStream) -> Result<u64, failure::Error> {
         let mut bytecount = 0;
         let mut buf = vec![0 as u8; 1 << 15];
         loop {
@@ -234,7 +227,6 @@ impl Client {
         log::info!("connecting to {:?}", self.connect);
 
         // Connect to the server
-        use net2::unix::UnixTcpBuilderExt;
         let conn = net2::TcpBuilder::new_v4()
             .unwrap()
             .reuse_port(true)
@@ -246,9 +238,7 @@ impl Client {
             .connect(&self.connect)
             .context("cannot connect to specified address")
             .unwrap();
-
         log::info!("connected {:?}", conn);
-        let (mut read, mut write) = split_tcp_stream(conn, self.buffered);
 
         // Set to true by the response reader thread to indicate
         // that the number-write thread should stop sending numbers.
@@ -257,9 +247,10 @@ impl Client {
         // Start a thread that reads the server's response
         let server_response_reader = {
             let stop_sending = stop_sending.clone();
+            let mut conn = conn.try_clone().expect("cannot clone connection handle");
             std::thread::spawn(move || -> Result<u32, io::Error> {
                 let mut buf = vec![0 as u8; 4];
-                let res = read
+                let res = conn
                     .read_exact(&mut buf[..])
                     .map(|_| BigEndian::read_u32(&buf[..]));
                 log::info!("server response received, stopping sender {:?}", res);
@@ -268,6 +259,7 @@ impl Client {
             })
         };
 
+        let mut buffered_conn = BufWriter::new(conn);
         let mut buf = vec![0 as u8; 4];
         let send_numbers_count = 1 << 23; // => will send at most 8 * 4 MiB numbers
         let mut write_err: Option<io::Error> = None;
@@ -291,7 +283,7 @@ impl Client {
 
             // Try to send the number. Stop sending numbers if an error occurs,
             // and remember that error.
-            let write_res = write.write_all(&buf[..]);
+            let write_res = buffered_conn.write_all(&buf[..]);
             if let Err(e) = write_res {
                 write_err = Some(e);
                 break;
