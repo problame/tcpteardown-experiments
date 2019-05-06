@@ -12,7 +12,9 @@ use net2::unix::UnixTcpBuilderExt;
 use structopt::StructOpt;
 #[macro_use]
 extern crate strum_macros;
+use strum::IntoEnumIterator;
 
+/// macro used to measure & log the duration of a given expression
 macro_rules! time_and_log_debug {
     ($name:expr, $e:expr) => {{
         let pre = std::time::Instant::now();
@@ -28,32 +30,29 @@ macro_rules! time_and_log_debug {
 enum App {
     Server(Server),
     Client(Client),
+    Modes,
 }
 
 #[derive(StructOpt)]
 struct Server {
+    #[structopt(help = "bind listening to socket to IP:port")]
     listen: String,
-    #[structopt(
-        help = "`close-immediately`, `drain-then-close`, `shutdown-write-then-drain`, `sleep-then-close`, `shutdown-both-then-close`"
-    )]
+    #[structopt(help = "use `modes` subcommand to list modes")]
     teardown_mode: TeardownMode,
     #[structopt(
         long = "sleep",
-        help = "time to sleep when using `sleep-then-close` teardown mode",
+        help = "time to sleep for teardown modes that sleep",
         default_value = "5ms"
     )]
     sleep: humantime::Duration,
-
-    /// Quote from socket(7) on the linger sockopt (Linux)
-    /// When  enabled,  a close(2) or shutdown(2) will not return until all queued messages for the socket have
-    /// been successfully sent or the linger timeout has been reached.  Otherwise, the call returns immediately
-    /// and  the  closing  is  done in the background.  When the socket is closed as part of exit(2), it always
-    /// lingers in the background.
-    #[structopt(long = "linger")]
+    #[structopt(
+        long = "linger",
+        help = "enable lingering for client connections (e.g. `2s`)"
+    )]
     linger: Option<humantime::Duration>,
 }
 
-#[derive(EnumString)]
+#[derive(EnumString, EnumIter, Display)]
 #[strum(serialize_all = "kebab_case")]
 enum TeardownMode {
     CloseImmediately,
@@ -66,8 +65,10 @@ enum TeardownMode {
 
 #[derive(StructOpt)]
 struct Client {
-    bind: String,
-    connect: String,
+    #[structopt(help = "SERVER_IP:SERVER_PORT")]
+    server: String,
+    #[structopt(long = "bind", help = "bind connecting socket to address IP:port")]
+    bind: Option<String>,
     #[structopt(long = "times", default_value = "1")]
     times: usize,
 }
@@ -86,6 +87,10 @@ impl App {
         match self {
             App::Server(s) => s.run(),
             App::Client(c) => c.run(),
+            App::Modes => {
+                TeardownMode::iter().for_each(|e| println!("{}", e));
+                Ok(())
+            }
         }
     }
 }
@@ -224,20 +229,21 @@ impl Client {
     }
 
     fn single_run(&self) -> SingleRunResult {
-        log::info!("connecting to {:?}", self.connect);
+        log::info!("connecting to {:?}", self.server);
 
         // Connect to the server
-        let conn = net2::TcpBuilder::new_v4()
-            .unwrap()
-            .reuse_port(true)
-            .context("reuse port")
-            .unwrap()
-            .bind(&self.bind)
-            .context("cannot bind to specified address")
-            .unwrap()
-            .connect(&self.connect)
-            .context("cannot connect to specified address")
-            .unwrap();
+        let conn = {
+            let builder = net2::TcpBuilder::new_v4().unwrap();
+            builder.reuse_port(true).expect("reuse port");
+            if let Some(bind) = &self.bind {
+                builder
+                    .bind(bind)
+                    .expect("cannot bind to specified address");
+            }
+            builder
+                .connect(&self.server)
+                .expect("cannot connect to specified address")
+        };
         log::info!("connected {:?}", conn);
 
         // Set to true by the response reader thread to indicate
@@ -291,7 +297,9 @@ impl Client {
         }
 
         // Retrieve the response reader's result.
-        let read_res: io::Result<u32> = server_response_reader.join().expect("thread panicked");
+        let read_res: io::Result<u32> = server_response_reader
+            .join()
+            .expect("receiver thread panicked");
         let read_err: Option<io::Error> = read_res.map(|_num| ()).err();
 
         // Categorize what we observed in this run (used for statistics)
